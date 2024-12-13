@@ -1,0 +1,227 @@
+---
+title: "correct heteroplasmy for EdgeR fitting and subsequent GSEA analysis"
+output:
+  html_document:
+    output_file: "DEG analysis and GSEA plotting.html"
+    output_dir: "intermediate_results" 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## EdgeR YW2 RM refitting
+
+Corrected heteroplasmy for d6 and d15 heteroplasmy are 35% and 22%. 
+
+### EdgeR fitting
+
+
+
+```{r edgeR_fitting_correct_heteroplasmy_YW2_RM}
+library(edgeR)
+
+rawCounts<-read.table('5022D_rawCounts.txt',header=T,row.names=1)
+##remove YW2 
+rawCounts <- rawCounts[,-2]
+
+dge <- DGEList(counts=rawCounts)
+#filter
+keep <- filterByExpr(dge)
+dge <- dge[keep, ]
+#normalize
+dge <- calcNormFactors(dge)
+
+
+heteroplasmy_levels_corr <- c(0, 1, 1, 0, 0, 0.6, 0.6)#unit: every 35% heteroplasmy change
+#heteroplasmy_levels_corr <- c(0, 0.4, 0.4, 0, 0, 0.2, 0.2) #unit: every 100% heteroplasmy 
+design <- model.matrix(~heteroplasmy_levels_corr)
+
+dge <- estimateDisp(dge, design)
+
+#fit the model
+fit <- glmFit(dge, design)
+lrt <- glmLRT(fit, coef="heteroplasmy_levels_corr")
+res <- topTags(lrt, n=Inf)
+#res$table
+
+##annotation
+# To load the unique biomart_data from the saved CSV file
+biomart_data_unique <- read.csv("intermediate_results/biomart_data_unique.csv")
+# Convert row names of 'res$table' to a column
+res$table$ensembl_gene_id <- rownames(res$table)
+
+# Merge the results with the biomart_data_unique by ensembl_gene_id
+merged_res <- merge(res$table, biomart_data_unique, by = "ensembl_gene_id", all.x = TRUE)
+
+# to set the row names of the merged results back to the Ensembl gene IDs:
+rownames(merged_res) <- merged_res$ensembl_gene_id
+# Drop the ensembl_gene_id column as it's now redundant
+merged_res$ensembl_gene_id <- NULL
+
+# #export the intermediate results
+# write.csv(merged_res, "intermediate_results/edgeR_YM2_RM_correct_heteroplasmy_34_25.csv", row.names=TRUE)
+
+
+```
+
+### GSEA for KEGG
+
+
+
+```{r GSEA for correct heteroplasmy}
+merged_results_imported <- read.csv("intermediate_results/edgeR_YM2_RM_correct_heteroplasmy_34_25.csv", header=TRUE,row.names=1)
+
+merged_results_imported$signed_log_pvalue <- -log10(merged_results_imported$PValue) * sign(merged_results_imported$logFC) #using raw p value
+
+#ranked
+merged_results_imported <- merged_results_imported[order(merged_results_imported$signed_log_pvalue, decreasing = TRUE), ]
+
+ranked_genes_values <- merged_results_imported$signed_log_pvalue
+names(ranked_genes_values) <- merged_results_imported$hgnc_symbol
+
+
+library(fgsea)
+library(msigdbr)
+
+# Get the MSigDB gene sets for Homo sapiens
+msigdb_sets <- msigdbr(species = "Homo sapiens")
+# Extract the C2 curated gene sets as an example
+pathways <- split(msigdb_sets[msigdb_sets$gs_cat == "C2",]$gene_symbol, msigdb_sets[msigdb_sets$gs_cat == "C2",]$gs_name)
+
+# Run GSEA
+gsea_results <- fgsea(pathways, ranked_genes_values, minSize=15, maxSize=500, nproc=1)
+
+
+
+significant_pathways <- gsea_results[gsea_results$padj < 0.05, ]
+
+#make summary of misgDB sets to merge to get hierarchical info
+library(dplyr)
+msigdb_summary <- msigdb_sets %>%
+  group_by(gs_name) %>%
+  summarize(description = first(gs_description), gs_subcat = first(gs_subcat))  # keep gs description column
+
+significant_pathways <- merge(significant_pathways, msigdb_summary, by.x="pathway", by.y="gs_name")
+
+#order pathway by NES
+significant_pathways <- significant_pathways[order(significant_pathways$NES), ]
+
+
+#hierarchicals
+unique_subcats <- unique(significant_pathways$gs_subcat)
+#unique_subcats
+
+
+library(dplyr)
+library(ggplot2)
+
+plot_gsea_for_group <- function(data, title) {
+    data <- arrange(data, desc(NES))  # Explicitly order data by NES in descending order using dplyr's arrange
+    data$pathway <- factor(data$pathway, levels=rev(data$pathway))  # Set the factor levels explicitly in reverse order
+    ggplot(data, aes(pathway, NES)) +
+      geom_bar(stat="identity", aes(fill=padj), width=0.7) +
+      coord_flip() +
+      scale_fill_gradient2(low="blue", high="red", mid="white", midpoint=0.025, limit=c(0,0.05), name="Adj. P-value") +
+      labs(title=title, x="Pathway", y="Normalized Enrichment Score (NES)") +
+      theme_minimal() +
+      theme(axis.text.y=element_text(size=6))
+}
+
+
+# 
+# # Save plots to a PDF
+# pdf("intermediate_results/edgeR_YW2_rm_correct_heteroplasmy_GSEA_results_by_hierarchy.pdf", width=10, height=8)
+# 
+# 
+# # Since unique_cats only contains "C2", we can focus on the subcategories
+# for(subcat in unique_subcats) {
+#     subcat_data <- subset(significant_pathways, gs_subcat == subcat)
+#     p <- plot_gsea_for_group(subcat_data, paste("C2", subcat, sep=": "))
+#     print(p)
+# }
+# 
+# dev.off()  # Close the PDF device
+
+
+##for KEGG ploting#########################################################
+##plot gsea to relocate the pathway names
+## use description for plot
+plot_gsea_kegg <- function(data, title) {
+    
+    data <- arrange(data, desc(NES))
+    data$description <- factor(data$description, levels=rev(data$description))
+    
+    ggplot(data, aes(description, NES)) +
+      geom_bar(stat="identity", aes(fill=padj), width=0.7) +
+      geom_text(aes(label=description, y=ifelse(NES > 0, -0.1, 0.1), 
+                    hjust=ifelse(NES > 0, 1, 0)), size=3) +
+      coord_flip() +
+      scale_fill_gradient2(low="red", mid="purple", high="blue", midpoint=0.025, limit=c(0,0.05), name="Adj. P-value") +
+      labs(title=title, x="", y="Normalized Enrichment Score (NES)") +  # Empty x-axis label since we're labeling bars directly
+      theme_minimal() +
+      theme(axis.text.y=element_blank(),  # Hide y-axis text since we're labeling bars directly
+            axis.ticks.y=element_blank())
+}
+
+
+
+# # Extract KEGG pathways subset
+# kegg_data <- subset(significant_pathways, gs_subcat == "CP:KEGG")
+
+
+# #export the all the significant kegg pathways below:
+# library(writexl)
+# 
+# # Convert list columns to string representations (if they exist)
+# if("leadingEdge" %in% colnames(kegg_data)) {
+#   kegg_data$leadingEdge <- sapply(kegg_data$leadingEdge, function(x) paste(x, collapse=","))
+# }
+# # Save as XLSX
+# write_xlsx(kegg_data, "intermediate_results/KEGG_significant_pathways_edgeR_YW2_RM_correct_heteroplasmy.xlsx")
+# 
+
+
+##read in the kegg_data:
+
+
+library(readxl)
+
+kegg_data <- read_xlsx("intermediate_results/KEGG_significant_pathways_edgeR_YW2_RM_correct_heteroplasmy.xlsx")
+
+
+##KEGG to plot
+library(dplyr)
+
+# List of pathways to exclude
+exclude_pathways <- c("KEGG_CARDIAC_MUSCLE_CONTRACTION", 
+                      "KEGG_PATHOGENIC_ESCHERICHIA_COLI_INFECTION", 
+                      "KEGG_HYPERTROPHIC_CARDIOMYOPATHY_HCM", 
+                      "KEGG_ARRHYTHMOGENIC_RIGHT_VENTRICULAR_CARDIOMYOPATHY_ARVC", 
+                      "KEGG_DILATED_CARDIOMYOPATHY",
+                      "KEGG_VIBRIO_CHOLERAE_INFECTION")
+
+# Filter out these pathways
+filtered_pathways <- kegg_data %>%
+  filter(!pathway %in% exclude_pathways)
+
+# Now you can plot using the 'filtered_pathways' dataset
+
+
+# Plot KEGG pathways
+p_kegg <- plot_gsea_kegg(filtered_pathways, "C2: KEGG")
+
+
+#print(p_kegg)
+
+ggsave(filename="plots and tables to present/kegg_GSEA_edgeR_YW2_RM_correct_heteroplasmy.png", plot=p_kegg, width=8, height=5) #width 8 is minimal to keep all pathway names
+
+
+
+
+
+
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
